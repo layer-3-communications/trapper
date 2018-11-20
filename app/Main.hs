@@ -84,8 +84,13 @@ runUDPServerForever output nagios (Settings resolver services hosts _ _) = do
           Left err -> do
             FL.pushLogStr output (FL.toLogStr (BB.toLazyByteString ("Failed to decode trap from " <> IPv4.builderUtf8 addr <> " with error: " <> fromString err)))
           Right (MessageV2 _ (PdusSnmpTrap trap)) -> do
-            FL.pushLogStr nagios (FL.toLogStr (BB.toLazyByteString (trapToBuilder resolver hosts services seconds addr trap)))
             FL.pushLogStr output (FL.toLogStr (BB.toLazyByteString (prettyTrapToBuilder resolver hosts addr trap)))
+            FL.pushLogStr nagios (FL.toLogStr (BB.toLazyByteString (trapToBuilder resolver hosts services seconds addr trap)))
+            -- The nagios handle is flushed after every write. We do this because
+            -- other processes may be appending to this file as well. Flushing here
+            -- means that only very large messages (bigger than 4K) run a risk of
+            -- getting split in half by another message.
+            FL.flushLogStr nagios
           _ -> FL.pushLogStr output (FL.toLogStr (BB.toLazyByteString ("Wrong PDU type in trap from " <> IPv4.builderUtf8 addr)))
         go
   go
@@ -101,7 +106,7 @@ trapToBuilder r hosts services seconds addr (TrapPdu oid _ typ code _ vars) = ca
     <> BB.char7 ';'
     <> BB.byteString name
     <> BB.char7 ';'
-    <> BB.char7 (case status of {StatusUp -> '0'; StatusDown -> '1'})
+    <> BB.char7 (case status of {StatusUp -> '0'; StatusDown -> '2'})
     <> BB.char7 ';'
     <> "Variables:"
     <> foldMap (encodeVarBind "<br>" r) vars

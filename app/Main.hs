@@ -7,44 +7,44 @@
 
 module Main where
 
+import Control.Applicative ((<|>))
+import Control.Applicative (liftA2)
+import Control.Exception (bracket)
+import Data.Aeson ((.:),(.:?),(.!=))
+import Data.Aeson (FromJSON)
+import Data.Bifunctor (first,second,bimap)
+import Data.ByteString (ByteString)
+import Data.HashMap.Strict (HashMap)
+import Data.Int (Int64)
+import Data.IntMap (IntMap)
+import Data.Map.Strict (Map)
+import Data.String (fromString)
+import Data.Text (Text)
 import Language.Asn.Types (ObjectIdentifier(..))
+import Net.Types (IPv4(..))
+import Snmp.Types (BindingResult(..),VarBind(..))
 import Snmp.Types (MessageV2(..),Pdus(..),TrapPdu(..),ObjectSyntax(..))
 import Snmp.Types (SimpleSyntax(..),ApplicationSyntax(..),GenericTrap(..))
-import Snmp.Types (BindingResult(..),VarBind(..))
-import Data.Text (Text)
-import Data.IntMap (IntMap)
-import Data.ByteString (ByteString)
-import Data.Aeson (FromJSON)
-import Net.Types (IPv4(..))
 import System.Log.FastLogger (LoggerSet)
-import Control.Exception (bracket)
-import Control.Applicative (liftA2)
-import Data.String (fromString)
-import Data.Aeson ((.:),(.:?),(.!=))
-import Data.Bifunctor (first,second,bimap)
-import Control.Applicative ((<|>))
-import Data.Map.Strict (Map)
-import Data.Int (Int64)
-import Data.HashMap.Strict (HashMap)
 
 import qualified Chronos as C
-import qualified System.Log.FastLogger as FL
-import qualified Language.Asn.Decoding as AsnDecoding
-import qualified Data.Text as T
-import qualified Snmp.Decoding as SnmpDecoding
-import qualified Network.Socket as NS
-import qualified Network.Socket.ByteString as NSB
-import qualified Data.ByteString.Builder as BB
+import qualified Data.Aeson as AE
 import qualified Data.ByteString as B
+import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as BC
+import qualified Data.HashMap.Strict as HM
 import qualified Data.IntMap.Strict as IM
 import qualified Data.List as L
-import qualified Data.Primitive as PM
 import qualified Data.Map.Strict as M
-import qualified Data.Aeson as AE
+import qualified Data.Primitive as PM
+import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import qualified Language.Asn.Decoding as AsnDecoding
 import qualified Net.IPv4 as IPv4
-import qualified Data.HashMap.Strict as HM
+import qualified Network.Socket as NS
+import qualified Network.Socket.ByteString as NSB
+import qualified Snmp.Decoding as SnmpDecoding
+import qualified System.Log.FastLogger as FL
 
 main :: IO ()
 main = do

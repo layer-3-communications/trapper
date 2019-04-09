@@ -8,21 +8,20 @@
 module Main where
 
 import Language.Asn.Types (ObjectIdentifier(..))
-import Net.Snmp.Types (MessageV2(..),Pdus(..),TrapPdu(..),ObjectSyntax(..))
-import Net.Snmp.Types (SimpleSyntax(..),ApplicationSyntax(..),GenericTrap(..))
+import Snmp.Types (MessageV2(..),Pdus(..),TrapPdu(..),ObjectSyntax(..))
+import Snmp.Types (SimpleSyntax(..),ApplicationSyntax(..),GenericTrap(..))
+import Snmp.Types (BindingResult(..),VarBind(..))
 import Data.Text (Text)
-import Net.Snmp.Types (BindingResult(..),VarBind(..))
 import Data.IntMap (IntMap)
 import Data.ByteString (ByteString)
-import Data.Aeson (FromJSON,FromJSONKey)
-import GHC.Generics (Generic)
+import Data.Aeson (FromJSON)
 import Net.Types (IPv4(..))
 import System.Log.FastLogger (LoggerSet)
 import Control.Exception (bracket)
 import Control.Applicative (liftA2)
 import Data.String (fromString)
 import Data.Aeson ((.:),(.:?),(.!=))
-import Data.Bifunctor (first,second)
+import Data.Bifunctor (first,second,bimap)
 import Control.Applicative ((<|>))
 import Data.Map.Strict (Map)
 import Data.Int (Int64)
@@ -32,11 +31,9 @@ import qualified Chronos as C
 import qualified System.Log.FastLogger as FL
 import qualified Language.Asn.Decoding as AsnDecoding
 import qualified Data.Text as T
-import qualified Net.Snmp.Decoding as SnmpDecoding
-import qualified Data.ByteString as ByteString
+import qualified Snmp.Decoding as SnmpDecoding
 import qualified Network.Socket as NS
 import qualified Network.Socket.ByteString as NSB
-import qualified Data.ByteString.Lazy as LB
 import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC
@@ -69,11 +66,11 @@ runUDPServerForever ::
   -> LoggerSet -- ^ this logger should write to a nagios named pipe
   -> Settings
   -> IO ()
-runUDPServerForever output nagios (Settings resolver services hosts _ _) = do
+runUDPServerForever output nagios (Settings resolver services hosts notes _ _) = do
   FL.pushLogStr output "Beginning trapper."
   -- FL.pushLogStr output (FL.toLogStr (BB.toLazyByteString ("Beginning trapper. Decoding OIDs with:" <> encodeResolver resolver)))
   sock <- NS.socket NS.AF_INET NS.Datagram NS.defaultProtocol
-  NS.bind sock (NS.SockAddrInet 162 NS.iNADDR_ANY)
+  NS.bind sock (NS.SockAddrInet 162 0)
   FL.pushLogStr output "\nBound to port 162. Listening for SNMP traps.\n"
   let go = do
         (bs,sockAddr) <- NSB.recvFrom sock 4096
@@ -85,7 +82,7 @@ runUDPServerForever output nagios (Settings resolver services hosts _ _) = do
             FL.pushLogStr output (FL.toLogStr (BB.toLazyByteString ("Failed to decode trap from " <> IPv4.builderUtf8 addr <> " with error: " <> fromString err)))
           Right (MessageV2 _ (PdusSnmpTrap trap)) -> do
             FL.pushLogStr output (FL.toLogStr (BB.toLazyByteString (prettyTrapToBuilder resolver hosts addr trap)))
-            FL.pushLogStr nagios (FL.toLogStr (BB.toLazyByteString (trapToBuilder resolver hosts services seconds addr trap)))
+            FL.pushLogStr nagios (FL.toLogStr (BB.toLazyByteString (trapToBuilder resolver hosts services notes seconds addr trap)))
             -- The nagios handle is flushed after every write. We do this because
             -- other processes may be appending to this file as well. Flushing here
             -- means that only very large messages (bigger than 4K) run a risk of
@@ -95,8 +92,8 @@ runUDPServerForever output nagios (Settings resolver services hosts _ _) = do
         go
   go
 
-trapToBuilder :: Resolver -> Map IPv4 ByteString -> HashMap ByteString Service -> Int64 -> IPv4 -> TrapPdu -> BB.Builder
-trapToBuilder r hosts services seconds addr (TrapPdu oid _ typ code _ vars) = case HM.lookup (trapDescription leftovers (fromIntegral code) typ) services of
+trapToBuilder :: Resolver -> Map IPv4 ByteString -> HashMap ByteString Service -> HashMap ByteString ByteString -> Int64 -> IPv4 -> TrapPdu -> BB.Builder
+trapToBuilder r hosts services notes seconds addr (TrapPdu oid _ typ code _ vars) = case HM.lookup trapName services of
   Nothing -> mempty
   Just (Service name status) ->
        BB.char7 '['
@@ -106,13 +103,15 @@ trapToBuilder r hosts services seconds addr (TrapPdu oid _ typ code _ vars) = ca
     <> BB.char7 ';'
     <> BB.byteString name
     <> BB.char7 ';'
-    <> BB.char7 (case status of {StatusUp -> '0'; StatusDown -> '2'})
+    <> BB.char7 (case status of {StatusRecovery -> '0'; StatusWarning -> '1'; StatusCritical -> '2'; StatusUnknown -> '3'})
     <> BB.char7 ';'
     <> "Variables:"
     <> foldMap (encodeVarBind "<br>" r) vars
+    <> (maybe mempty (\x -> "<br>" <> BB.byteString x) (HM.lookup trapName notes))
     <> BB.char7 '\n'
   where
-  (descr,_,traps,leftovers) = description oid r
+  trapName = trapDescription leftovers (fromIntegral code) typ
+  (_,_,_,leftovers) = description oid r
 
 prettyTrapToBuilder :: Resolver -> Map IPv4 ByteString -> IPv4 -> TrapPdu -> BB.Builder
 prettyTrapToBuilder r reverseDns addr (TrapPdu oid _ typ code _ vars) =
@@ -128,7 +127,7 @@ prettyTrapToBuilder r reverseDns addr (TrapPdu oid _ typ code _ vars) =
   <> foldMap (encodeVarBind (BC.singleton '\n') r) vars
   <> "\n"
   where
-  (descr,_,traps,leftovers) = description oid r
+  (descr,_,_,leftovers) = description oid r
 
 encodeVarBind :: ByteString -> Resolver -> VarBind -> BB.Builder
 encodeVarBind sep r (VarBind name res) = BB.byteString sep <> descr <> ": " <> encodeResult r m res
@@ -203,6 +202,7 @@ data Settings = Settings
   { settingsDescriptions :: !Resolver
   , settingsServices :: !(HashMap ByteString Service)
   , settingsHosts :: !(Map IPv4 ByteString)
+  , settingsNotes :: !(HashMap ByteString ByteString)
   , settingsNagios :: !Output
   , settingsLogging :: !Output
   }
@@ -212,6 +212,7 @@ instance FromJSON Settings where
     <$> m .: "descriptions"
     <*> fmap (HM.fromList . map (first TE.encodeUtf8) . HM.toList) (m .: "services")
     <*> fmap (M.fromList . map (second TE.encodeUtf8) . HM.toList) (m .: "hosts")
+    <*> fmap (HM.fromList . map (bimap TE.encodeUtf8 TE.encodeUtf8) . HM.toList) (m .: "notes")
     <*> m .: "nagios"
     <*> m .: "logging"
 
@@ -226,7 +227,7 @@ instance FromJSON Output where
     "stderr" -> OutputStderr
     _ -> OutputFile (T.unpack t)
 
-data Status = StatusUp | StatusDown
+data Status = StatusRecovery | StatusWarning | StatusCritical | StatusUnknown
   deriving stock (Eq,Ord)
 
 data Service = Service
@@ -237,15 +238,17 @@ data Service = Service
 instance FromJSON Service where
   parseJSON = AE.withText "Service" $ \t -> case T.splitOn (T.singleton '.') t of
     [a,b] -> maybe
-      (fail "invalid status, expected up or down")
+      (fail "invalid status, expected: recovery, warning, critical, or unknown")
       (pure . Service (TE.encodeUtf8 a))
       (statusFromText b)
     _ -> fail "service should be separated by a dot"
 
 statusFromText :: Text -> Maybe Status
 statusFromText = \case
-  "up" -> Just StatusUp
-  "down" -> Just StatusDown
+  "recovery" -> Just StatusRecovery
+  "warning" -> Just StatusWarning
+  "critical" -> Just StatusCritical
+  "unknown" -> Just StatusUnknown
   _ -> Nothing
 
 data Resolver = Resolver

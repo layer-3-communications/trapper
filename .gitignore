@@ -4,3 +4,4 @@ settings.json
 dist
 dist-newstyle
 .ghc-environment*
+.ghc.environment*

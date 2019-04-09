@@ -20,18 +20,20 @@ executable trapper
   main-is: Main.hs
   hs-source-dirs:
       app
-  ghc-options: -O2 -threaded -rtsopts -with-rtsopts=-N
+  ghc-options: -O2 -threaded -rtsopts -with-rtsopts=-N -Wall -Werror
   build-depends:
       base >= 4.12 && <5
-    , asn1-codec
-    , network
-    , bytestring
-    , containers
-    , primitive >= 0.6.4
-    , aeson >= 1.4.1
+    , snmp ^>= 0.3.1
+    , network ^>= 3.0.1.1
+    , bytestring ^>= 0.10.8.2
+    , containers ^>= 0.6.0.1
+    , primitive ^>= 0.6.4
+    , aeson ^>= 1.4.1
     , text
-    , ip
+    , ip ^>= 1.5
     , fast-logger
     , chronos >= 1.0.4
-    , unordered-containers
+    , unordered-containers ^>= 0.2.10
+    , transformers ^>= 0.5.6.2
+    , language-asn ^>= 0.1.1
   default-language: Haskell2010

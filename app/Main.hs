@@ -164,6 +164,8 @@ prettyTrapV2ToBuilder r reverseDns addr oid vars =
   <> IPv4.builderUtf8 addr
   <> "\nHost: "
   <> maybe (IPv4.builderUtf8 addr) BB.byteString (M.lookup addr reverseDns)
+  <> "\nOID: "
+  <> BB.byteString (Oid.encodeByteString oid)
   <> "\nTrap Base: "
   <> descr
   <> "\nVariables:"

@@ -7,6 +7,7 @@
 
 module Main where
 
+import Control.Monad (guard)
 import Control.Applicative ((<|>))
 import Control.Applicative (liftA2)
 import Control.Exception (bracket)
@@ -20,16 +21,18 @@ import Data.IntMap (IntMap)
 import Data.Map.Strict (Map)
 import Data.String (fromString)
 import Data.Text (Text)
+import Data.Vector (Vector,(!?))
 import Language.Asn.Types (ObjectIdentifier(..))
 import Net.Types (IPv4(..))
 import Snmp.Types (BindingResult(..),VarBind(..))
-import Snmp.Types (MessageV2(..),Pdus(..),TrapPdu(..),ObjectSyntax(..))
+import Snmp.Types (MessageV2(..),Pdus(..),TrapPdu(..),Pdu(..),ObjectSyntax(..))
 import Snmp.Types (SimpleSyntax(..),ApplicationSyntax(..),GenericTrap(..))
 import System.Log.FastLogger (LoggerSet)
 
 import qualified Chronos as C
 import qualified Data.Aeson as AE
 import qualified Data.ByteString as B
+import qualified Data.ByteString.Lazy as LB
 import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.HashMap.Strict as HM
@@ -39,7 +42,9 @@ import qualified Data.Map.Strict as M
 import qualified Data.Primitive as PM
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import qualified Data.Vector as V
 import qualified Language.Asn.Decoding as AsnDecoding
+import qualified Language.Asn.ObjectIdentifier as Oid
 import qualified Net.IPv4 as IPv4
 import qualified Network.Socket as NS
 import qualified Network.Socket.ByteString as NSB
@@ -79,7 +84,14 @@ runUDPServerForever output nagios (Settings resolver services hosts notes _ _) =
         let addr = sockAddrToIPv4 sockAddr
         case AsnDecoding.ber SnmpDecoding.messageV2 bs of
           Left err -> do
-            FL.pushLogStr output (FL.toLogStr (BB.toLazyByteString ("Failed to decode trap from " <> IPv4.builderUtf8 addr <> " with error: " <> fromString err)))
+            FL.pushLogStr output (FL.toLogStr (BB.toLazyByteString ("Failed to decode trap from " <> IPv4.builderUtf8 addr <> " with error: " <> fromString err <> "\n")))
+          Right (MessageV2 _ (PdusSnmpV2Trap (Pdu _ _ _ bindings))) -> case sanityCheck bindings of
+            Just (oid,vars) -> do
+              FL.pushLogStr output (FL.toLogStr (BB.toLazyByteString (prettyTrapV2ToBuilder resolver hosts addr oid vars)))
+              FL.pushLogStr nagios (FL.toLogStr (BB.toLazyByteString (trapV2ToBuilder resolver hosts services notes seconds addr oid vars)))
+              -- See comment about flushing below.
+              FL.flushLogStr nagios
+            Nothing -> FL.pushLogStr output (FL.toLogStr ("Bad trap from " <> IPv4.builderUtf8 addr <> ", varbinds incorrect.\n"))
           Right (MessageV2 _ (PdusSnmpTrap trap)) -> do
             FL.pushLogStr output (FL.toLogStr (BB.toLazyByteString (prettyTrapToBuilder resolver hosts addr trap)))
             FL.pushLogStr nagios (FL.toLogStr (BB.toLazyByteString (trapToBuilder resolver hosts services notes seconds addr trap)))
@@ -91,6 +103,39 @@ runUDPServerForever output nagios (Settings resolver services hosts notes _ _) =
           _ -> FL.pushLogStr output (FL.toLogStr (BB.toLazyByteString ("Wrong PDU type in trap from " <> IPv4.builderUtf8 addr)))
         go
   go
+
+sanityCheck :: Vector VarBind -> Maybe (ObjectIdentifier,Vector VarBind)
+sanityCheck v = do
+  VarBind oidA _ <- v !? 0
+  guard (oidA == uptimeOid)
+  VarBind oidB res <- v !? 1
+  guard (oidB == trapOid)
+  case res of
+    BindingResultValue (ObjectSyntaxSimple (SimpleSyntaxObjectId oid)) ->
+      Just (oid, V.drop 2 v)
+    _ -> Nothing
+
+-- TODO: Factor out common code.
+trapV2ToBuilder :: Resolver -> Map IPv4 ByteString -> HashMap ByteString Service -> HashMap ByteString ByteString -> Int64 -> IPv4 -> ObjectIdentifier -> Vector VarBind -> BB.Builder
+trapV2ToBuilder r hosts services notes seconds addr oid vars = case HM.lookup trapName services of
+  Nothing -> mempty
+  Just (Service name status) ->
+       BB.char7 '['
+    <> BB.int64Dec seconds
+    <> "] PROCESS_SERVICE_CHECK_RESULT;"
+    <> maybe (IPv4.builderUtf8 addr) BB.byteString (M.lookup addr hosts)
+    <> BB.char7 ';'
+    <> BB.byteString name
+    <> BB.char7 ';'
+    <> BB.char7 (case status of {StatusOk -> '0'; StatusWarning -> '1'; StatusCritical -> '2'; StatusUnknown -> '3'})
+    <> BB.char7 ';'
+    <> "Variables:"
+    <> foldMap (encodeVarBind "<br>" r) vars
+    <> (maybe mempty (\x -> "<br>" <> BB.byteString x) (HM.lookup trapName notes))
+    <> BB.char7 '\n'
+  where
+  (trapNameBuilder,_,_,_) = description oid r
+  trapName = LB.toStrict (BB.toLazyByteString trapNameBuilder)
 
 trapToBuilder :: Resolver -> Map IPv4 ByteString -> HashMap ByteString Service -> HashMap ByteString ByteString -> Int64 -> IPv4 -> TrapPdu -> BB.Builder
 trapToBuilder r hosts services notes seconds addr (TrapPdu oid _ typ code _ vars) = case HM.lookup trapName services of
@@ -112,6 +157,20 @@ trapToBuilder r hosts services notes seconds addr (TrapPdu oid _ typ code _ vars
   where
   trapName = trapDescription leftovers (fromIntegral code) typ
   (_,_,_,leftovers) = description oid r
+
+prettyTrapV2ToBuilder :: Resolver -> Map IPv4 ByteString -> IPv4 -> ObjectIdentifier -> Vector VarBind -> BB.Builder
+prettyTrapV2ToBuilder r reverseDns addr oid vars =
+     "\nHost Address: "
+  <> IPv4.builderUtf8 addr
+  <> "\nHost: "
+  <> maybe (IPv4.builderUtf8 addr) BB.byteString (M.lookup addr reverseDns)
+  <> "\nTrap Base: "
+  <> descr
+  <> "\nVariables:"
+  <> foldMap (encodeVarBind (BC.singleton '\n') r) vars
+  <> "\n"
+  where
+  (descr,_,_,_) = description oid r
 
 prettyTrapToBuilder :: Resolver -> Map IPv4 ByteString -> IPv4 -> TrapPdu -> BB.Builder
 prettyTrapToBuilder r reverseDns addr (TrapPdu oid _ typ code _ vars) =
@@ -306,3 +365,8 @@ description oid r = case resolution oid r of
 wordToInt :: Word -> Int
 wordToInt = fromIntegral
 
+uptimeOid :: ObjectIdentifier
+uptimeOid = Oid.fromList [1,3,6,1,2,1,1,3,0]
+
+trapOid :: ObjectIdentifier
+trapOid = Oid.fromList [1,3,6,1,6,3,1,1,4,1,0]

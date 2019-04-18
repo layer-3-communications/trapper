@@ -103,7 +103,7 @@ trapToBuilder r hosts services notes seconds addr (TrapPdu oid _ typ code _ vars
     <> BB.char7 ';'
     <> BB.byteString name
     <> BB.char7 ';'
-    <> BB.char7 (case status of {StatusRecovery -> '0'; StatusWarning -> '1'; StatusCritical -> '2'; StatusUnknown -> '3'})
+    <> BB.char7 (case status of {StatusOk -> '0'; StatusWarning -> '1'; StatusCritical -> '2'; StatusUnknown -> '3'})
     <> BB.char7 ';'
     <> "Variables:"
     <> foldMap (encodeVarBind "<br>" r) vars
@@ -227,7 +227,7 @@ instance FromJSON Output where
     "stderr" -> OutputStderr
     _ -> OutputFile (T.unpack t)
 
-data Status = StatusRecovery | StatusWarning | StatusCritical | StatusUnknown
+data Status = StatusOk | StatusWarning | StatusCritical | StatusUnknown
   deriving stock (Eq,Ord)
 
 data Service = Service
@@ -238,14 +238,14 @@ data Service = Service
 instance FromJSON Service where
   parseJSON = AE.withText "Service" $ \t -> case T.splitOn (T.singleton '.') t of
     [a,b] -> maybe
-      (fail "invalid status, expected: recovery, warning, critical, or unknown")
+      (fail "invalid status, expected: ok, warning, critical, or unknown")
       (pure . Service (TE.encodeUtf8 a))
       (statusFromText b)
     _ -> fail "service should be separated by a dot"
 
 statusFromText :: Text -> Maybe Status
 statusFromText = \case
-  "recovery" -> Just StatusRecovery
+  "ok" -> Just StatusOk
   "warning" -> Just StatusWarning
   "critical" -> Just StatusCritical
   "unknown" -> Just StatusUnknown

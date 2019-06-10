@@ -1,0 +1,5 @@
+packages: .
+source-repository-package
+  type: git
+  location: https://github.com/haskell-snmp/snmp
+  tag: cf972c3012aab28f1ae98fdaa4e8aeb19650d516

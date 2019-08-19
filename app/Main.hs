@@ -1,16 +1,18 @@
 {-# language BangPatterns #-}
 {-# language DeriveAnyClass #-}
-{-# language OverloadedStrings #-}
-{-# language LambdaCase #-}
-{-# language DerivingStrategies #-}
 {-# language DeriveGeneric #-}
+{-# language DerivingStrategies #-}
+{-# language LambdaCase #-}
+{-# language NumericUnderscores #-}
+{-# language OverloadedStrings #-}
+{-# language ScopedTypeVariables #-}
 
 module Main where
 
 import Control.Monad (guard)
 import Control.Applicative ((<|>))
-import Control.Applicative (liftA2)
-import Control.Exception (bracket)
+import Control.Concurrent (threadDelay)
+import Control.Exception (bracket,catch,onException)
 import Data.Aeson ((.:),(.:?),(.!=))
 import Data.Aeson (FromJSON)
 import Data.Bifunctor (first,second,bimap)
@@ -18,6 +20,7 @@ import Data.ByteString (ByteString)
 import Data.HashMap.Strict (HashMap)
 import Data.Int (Int64)
 import Data.IntMap (IntMap)
+import Data.IORef (IORef,readIORef,writeIORef,newIORef)
 import Data.Map.Strict (Map)
 import Data.String (fromString)
 import Data.Text (Text)
@@ -27,6 +30,7 @@ import Net.Types (IPv4(..))
 import Snmp.Types (BindingResult(..),VarBind(..))
 import Snmp.Types (MessageV2(..),Pdus(..),TrapPdu(..),Pdu(..),ObjectSyntax(..))
 import Snmp.Types (SimpleSyntax(..),ApplicationSyntax(..),GenericTrap(..))
+import System.IO (Handle,IOMode(WriteMode),openFile,stderr,stdout,hPutStrLn)
 import System.Log.FastLogger (LoggerSet)
 
 import qualified Chronos as C
@@ -56,9 +60,19 @@ main = do
   AE.eitherDecodeFileStrict "settings.json" >>= \case
     Left e -> fail ("bad settings file: " ++ e)
     Right s -> bracket
-      (liftA2 (,) (outputToLoggerSet (settingsLogging s)) (outputToLoggerSet (settingsNagios s)))
-      (\(output,nagios) -> FL.rmLoggerSet output *> FL.rmLoggerSet nagios)
-      (\(output,nagios) -> runUDPServerForever output nagios s)
+      (do output <- outputToLoggerSet (settingsLogging s)
+          case settingsNagios s of
+            OutputStdout -> pure (output,stdout)
+            OutputStderr -> pure (output,stderr)
+            OutputFile path -> do
+              nagios <- openFile path WriteMode
+              pure (output,nagios)
+      )
+      (\(output,_) -> FL.rmLoggerSet output)
+      (\(output,nagios) -> do
+        nagiosRef <- newIORef nagios
+        runUDPServerForever output nagiosRef s
+      )
 
 outputToLoggerSet :: Output -> IO LoggerSet
 outputToLoggerSet = \case
@@ -68,17 +82,19 @@ outputToLoggerSet = \case
 
 runUDPServerForever ::
      LoggerSet -- ^ this logger should write to stdout or a log file
-  -> LoggerSet -- ^ this logger should write to a nagios named pipe
+  -> IORef Handle -- ^ this logger should write to a nagios named pipe
   -> Settings
   -> IO ()
-runUDPServerForever output nagios (Settings resolver services hosts notes _ _) = do
+runUDPServerForever output nagiosRef (Settings resolver services hosts notes nagiosOutput _) = do
   FL.pushLogStr output "Beginning trapper."
   -- FL.pushLogStr output (FL.toLogStr (BB.toLazyByteString ("Beginning trapper. Decoding OIDs with:" <> encodeResolver resolver)))
   sock <- NS.socket NS.AF_INET NS.Datagram NS.defaultProtocol
   NS.bind sock (NS.SockAddrInet 162 0)
   FL.pushLogStr output "\nBound to port 162. Listening for SNMP traps.\n"
   let go = do
-        (bs,sockAddr) <- NSB.recvFrom sock 4096
+        (bs,sockAddr) <- onException
+          (NSB.recvFrom sock 4096)
+          (hPutStrLn stderr "Error context: NSB.recvFrom")
         C.Time nanoseconds <- C.now
         let seconds = div nanoseconds 1000000000
         let addr = sockAddrToIPv4 sockAddr
@@ -88,18 +104,42 @@ runUDPServerForever output nagios (Settings resolver services hosts notes _ _) =
           Right (MessageV2 _ (PdusSnmpV2Trap (Pdu _ _ _ bindings))) -> case sanityCheck bindings of
             Just (oid,vars) -> do
               FL.pushLogStr output (FL.toLogStr (BB.toLazyByteString (prettyTrapV2ToBuilder resolver hosts addr oid vars)))
-              FL.pushLogStr nagios (FL.toLogStr (BB.toLazyByteString (trapV2ToBuilder resolver hosts services notes seconds addr oid vars)))
+              nagios0 <- readIORef nagiosRef
+              let nagiosLine = LB.toStrict (BB.toLazyByteString (trapV2ToBuilder resolver hosts services notes seconds addr oid vars))
               -- See comment about flushing below.
-              FL.flushLogStr nagios
+              catch (B.hPut nagios0 nagiosLine)
+                (\(_ :: IOError) -> do
+                  FL.pushLogStr output "Nagios resource vanished (A). Reopening in three seconds.\n"
+                  threadDelay 3_000_000
+                  case nagiosOutput of
+                    OutputStdout -> fail "Not attempting to reopen stdout. Dieing."
+                    OutputStderr -> fail "Not attempting to reopen stderr. Dieing."
+                    OutputFile path -> do
+                      nagios1 <- openFile path WriteMode
+                      B.hPut nagios1 nagiosLine
+                      writeIORef nagiosRef nagios1
+                )
             Nothing -> FL.pushLogStr output (FL.toLogStr ("Bad trap from " <> IPv4.builderUtf8 addr <> ", varbinds incorrect.\n"))
           Right (MessageV2 _ (PdusSnmpTrap trap)) -> do
             FL.pushLogStr output (FL.toLogStr (BB.toLazyByteString (prettyTrapToBuilder resolver hosts addr trap)))
-            FL.pushLogStr nagios (FL.toLogStr (BB.toLazyByteString (trapToBuilder resolver hosts services notes seconds addr trap)))
+            nagios0 <- readIORef nagiosRef
+            let nagiosLine = LB.toStrict (BB.toLazyByteString (trapToBuilder resolver hosts services notes seconds addr trap))
             -- The nagios handle is flushed after every write. We do this because
             -- other processes may be appending to this file as well. Flushing here
             -- means that only very large messages (bigger than 4K) run a risk of
             -- getting split in half by another message.
-            FL.flushLogStr nagios
+            catch (B.hPut nagios0 nagiosLine)
+              (\(_ :: IOError) -> do
+                FL.pushLogStr output "Nagios resource vanished (B). Reopening in three seconds.\n"
+                threadDelay 3_000_000
+                case nagiosOutput of
+                  OutputStdout -> fail "Not attempting to reopen stdout. Dieing."
+                  OutputStderr -> fail "Not attempting to reopen stderr. Dieing."
+                  OutputFile path -> do
+                    nagios1 <- openFile path WriteMode
+                    B.hPut nagios1 nagiosLine
+                    writeIORef nagiosRef nagios1
+              )
           _ -> FL.pushLogStr output (FL.toLogStr (BB.toLazyByteString ("Wrong PDU type in trap from " <> IPv4.builderUtf8 addr)))
         go
   go

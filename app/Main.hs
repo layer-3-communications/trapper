@@ -3,7 +3,6 @@
 {-# language DeriveGeneric #-}
 {-# language DerivingStrategies #-}
 {-# language LambdaCase #-}
-{-# language NumericUnderscores #-}
 {-# language OverloadedStrings #-}
 {-# language ScopedTypeVariables #-}
 
@@ -110,7 +109,7 @@ runUDPServerForever output nagiosRef (Settings resolver services hosts notes nag
               catch (B.hPut nagios0 nagiosLine)
                 (\(_ :: IOError) -> do
                   FL.pushLogStr output "Nagios resource vanished (A). Reopening in three seconds.\n"
-                  threadDelay 3_000_000
+                  threadDelay 3000000
                   case nagiosOutput of
                     OutputStdout -> fail "Not attempting to reopen stdout. Dieing."
                     OutputStderr -> fail "Not attempting to reopen stderr. Dieing."
@@ -131,7 +130,7 @@ runUDPServerForever output nagiosRef (Settings resolver services hosts notes nag
             catch (B.hPut nagios0 nagiosLine)
               (\(_ :: IOError) -> do
                 FL.pushLogStr output "Nagios resource vanished (B). Reopening in three seconds.\n"
-                threadDelay 3_000_000
+                threadDelay 3000000
                 case nagiosOutput of
                   OutputStdout -> fail "Not attempting to reopen stdout. Dieing."
                   OutputStderr -> fail "Not attempting to reopen stderr. Dieing."

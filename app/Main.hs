@@ -52,6 +52,7 @@ import qualified Net.IPv4 as IPv4
 import qualified Network.Socket as NS
 import qualified Network.Socket.ByteString as NSB
 import qualified Snmp.Decoding as SnmpDecoding
+import qualified System.IO as IO
 import qualified System.Log.FastLogger as FL
 
 main :: IO ()
@@ -106,7 +107,7 @@ runUDPServerForever output nagiosRef (Settings resolver services hosts notes nag
               nagios0 <- readIORef nagiosRef
               let nagiosLine = LB.toStrict (BB.toLazyByteString (trapV2ToBuilder resolver hosts services notes seconds addr oid vars))
               -- See comment about flushing below.
-              catch (B.hPut nagios0 nagiosLine)
+              catch (B.hPut nagios0 nagiosLine *> IO.hFlush nagios0)
                 (\(_ :: IOError) -> do
                   FL.pushLogStr output "Nagios resource vanished (A). Reopening in three seconds.\n"
                   threadDelay 3000000
@@ -127,7 +128,7 @@ runUDPServerForever output nagiosRef (Settings resolver services hosts notes nag
             -- other processes may be appending to this file as well. Flushing here
             -- means that only very large messages (bigger than 4K) run a risk of
             -- getting split in half by another message.
-            catch (B.hPut nagios0 nagiosLine)
+            catch (B.hPut nagios0 nagiosLine *> IO.hFlush nagios0)
               (\(_ :: IOError) -> do
                 FL.pushLogStr output "Nagios resource vanished (B). Reopening in three seconds.\n"
                 threadDelay 3000000

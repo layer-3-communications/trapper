@@ -3,6 +3,7 @@
 {-# language DeriveGeneric #-}
 {-# language DerivingStrategies #-}
 {-# language LambdaCase #-}
+{-# language MagicHash #-}
 {-# language OverloadedStrings #-}
 {-# language ScopedTypeVariables #-}
 
@@ -46,6 +47,7 @@ import qualified Data.Primitive as PM
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Vector as V
+import qualified Data.Vector.Primitive as Primitive
 import qualified Language.Asn.Decoding as AsnDecoding
 import qualified Language.Asn.ObjectIdentifier as Oid
 import qualified Net.IPv4 as IPv4
@@ -85,7 +87,7 @@ runUDPServerForever ::
   -> IORef Handle -- ^ this logger should write to a nagios named pipe
   -> Settings
   -> IO ()
-runUDPServerForever output nagiosRef (Settings resolver services hosts notes nagiosOutput _) = do
+runUDPServerForever output nagiosRef (Settings resolver services hosts notes nagiosOutput _ interfaces) = do
   FL.pushLogStr output "Beginning trapper."
   -- FL.pushLogStr output (FL.toLogStr (BB.toLazyByteString ("Beginning trapper. Decoding OIDs with:" <> encodeResolver resolver)))
   sock <- NS.socket NS.AF_INET NS.Datagram NS.defaultProtocol
@@ -105,7 +107,7 @@ runUDPServerForever output nagiosRef (Settings resolver services hosts notes nag
             Just (oid,vars) -> do
               FL.pushLogStr output (FL.toLogStr (BB.toLazyByteString (prettyTrapV2ToBuilder resolver hosts addr oid vars)))
               nagios0 <- readIORef nagiosRef
-              let nagiosLine = LB.toStrict (BB.toLazyByteString (trapV2ToBuilder resolver hosts services notes seconds addr oid vars))
+              let nagiosLine = LB.toStrict (BB.toLazyByteString (trapV2ToBuilder resolver hosts services interfaces notes seconds addr oid vars))
               -- See comment about flushing below.
               catch (B.hPut nagios0 nagiosLine *> IO.hFlush nagios0)
                 (\(_ :: IOError) -> do
@@ -123,7 +125,7 @@ runUDPServerForever output nagiosRef (Settings resolver services hosts notes nag
           Right (MessageV2 _ (PdusSnmpTrap trap)) -> do
             FL.pushLogStr output (FL.toLogStr (BB.toLazyByteString (prettyTrapToBuilder resolver hosts addr trap)))
             nagios0 <- readIORef nagiosRef
-            let nagiosLine = LB.toStrict (BB.toLazyByteString (trapToBuilder resolver hosts services notes seconds addr trap))
+            let nagiosLine = LB.toStrict (BB.toLazyByteString (trapToBuilder resolver hosts services interfaces notes seconds addr trap))
             -- The nagios handle is flushed after every write. We do this because
             -- other processes may be appending to this file as well. Flushing here
             -- means that only very large messages (bigger than 4K) run a risk of
@@ -155,48 +157,89 @@ sanityCheck v = do
       Just (oid, V.drop 2 v)
     _ -> Nothing
 
+extraInterfaceCheck :: Maybe Interfaces -> ByteString -> Vector VarBind -> Bool
+extraInterfaceCheck mreqInterface trapName vars = if trapName == "linkUp" || trapName == "linkDown"
+  then case mreqInterface of
+    Just reqInterface -> case reqInterface of
+      All -> True
+      None -> False
+      Named intfs -> any (searchForInterface vars) intfs
+    Nothing -> False
+  else True
+
+searchForInterface :: Vector VarBind -> ByteString -> Bool
+searchForInterface !vars !reqInterface = 
+  case V.find (\(VarBind (ObjectIdentifier name@(PM.PrimArray name# )) _) -> Primitive.take 11 (Primitive.Vector 0 (PM.sizeofPrimArray name) (PM.ByteArray name#)) == ifName) vars of
+    Just (VarBind _ (BindingResultValue (ObjectSyntaxSimple (SimpleSyntaxString b)))) -> reqInterface == b
+    _ -> False
+
 -- TODO: Factor out common code.
-trapV2ToBuilder :: Resolver -> Map IPv4 ByteString -> HashMap ByteString Service -> HashMap ByteString ByteString -> Int64 -> IPv4 -> ObjectIdentifier -> Vector VarBind -> BB.Builder
-trapV2ToBuilder r hosts services notes seconds addr oid vars = case HM.lookup trapName services of
+trapV2ToBuilder ::
+     Resolver
+  -> Map IPv4 ByteString
+  -> HashMap ByteString Service
+  -> HashMap ByteString Interfaces
+  -> HashMap ByteString ByteString
+  -> Int64
+  -> IPv4
+  -> ObjectIdentifier
+  -> Vector VarBind
+  -> BB.Builder
+trapV2ToBuilder r hosts services interfaces notes seconds addr oid vars = case HM.lookup trapName services of
   Nothing -> mempty
-  Just (Service name status) ->
-       BB.char7 '['
-    <> BB.int64Dec seconds
-    <> "] PROCESS_SERVICE_CHECK_RESULT;"
-    <> maybe (IPv4.builderUtf8 addr) BB.byteString (M.lookup addr hosts)
-    <> BB.char7 ';'
-    <> BB.byteString name
-    <> BB.char7 ';'
-    <> BB.char7 (case status of {StatusOk -> '0'; StatusWarning -> '1'; StatusCritical -> '2'; StatusUnknown -> '3'})
-    <> BB.char7 ';'
-    <> "Variables:"
-    <> foldMap (encodeVarBind "<br>" r) vars
-    <> (maybe mempty (\x -> "<br>" <> BB.byteString x) (HM.lookup trapName notes))
-    <> BB.char7 '\n'
+  Just (Service name status) -> if extraInterfaceCheck (flip HM.lookup interfaces =<< mhost) trapName vars
+    then 
+         BB.char7 '['
+      <> BB.int64Dec seconds
+      <> "] PROCESS_SERVICE_CHECK_RESULT;"
+      <> maybe (IPv4.builderUtf8 addr) BB.byteString mhost
+      <> BB.char7 ';'
+      <> BB.byteString name
+      <> BB.char7 ';'
+      <> BB.char7 (case status of {StatusOk -> '0'; StatusWarning -> '1'; StatusCritical -> '2'; StatusUnknown -> '3'})
+      <> BB.char7 ';'
+      <> "Variables:"
+      <> foldMap (encodeVarBind "<br>" r) vars
+      <> (maybe mempty (\x -> "<br>" <> BB.byteString x) (HM.lookup trapName notes))
+      <> BB.char7 '\n'
+    else mempty
   where
   (trapNameBuilder,_,_,_) = description oid r
   trapName = LB.toStrict (BB.toLazyByteString trapNameBuilder)
+  mhost = M.lookup addr hosts
 
-trapToBuilder :: Resolver -> Map IPv4 ByteString -> HashMap ByteString Service -> HashMap ByteString ByteString -> Int64 -> IPv4 -> TrapPdu -> BB.Builder
-trapToBuilder r hosts services notes seconds addr (TrapPdu oid _ typ code _ vars) = case HM.lookup trapName services of
+trapToBuilder ::
+     Resolver
+  -> Map IPv4 ByteString
+  -> HashMap ByteString Service
+  -> HashMap ByteString Interfaces
+  -> HashMap ByteString ByteString
+  -> Int64
+  -> IPv4
+  -> TrapPdu
+  -> BB.Builder
+trapToBuilder r hosts services interfaces notes seconds addr (TrapPdu oid _ typ code _ vars) = case HM.lookup trapName services of
   Nothing -> mempty
-  Just (Service name status) ->
-       BB.char7 '['
-    <> BB.int64Dec seconds
-    <> "] PROCESS_SERVICE_CHECK_RESULT;"
-    <> maybe (IPv4.builderUtf8 addr) BB.byteString (M.lookup addr hosts)
-    <> BB.char7 ';'
-    <> BB.byteString name
-    <> BB.char7 ';'
-    <> BB.char7 (case status of {StatusOk -> '0'; StatusWarning -> '1'; StatusCritical -> '2'; StatusUnknown -> '3'})
-    <> BB.char7 ';'
-    <> "Variables:"
-    <> foldMap (encodeVarBind "<br>" r) vars
-    <> (maybe mempty (\x -> "<br>" <> BB.byteString x) (HM.lookup trapName notes))
-    <> BB.char7 '\n'
+  Just (Service name status) -> if extraInterfaceCheck (flip HM.lookup interfaces =<< mhost) trapName (V.fromList vars)
+    then
+         BB.char7 '['
+      <> BB.int64Dec seconds
+      <> "] PROCESS_SERVICE_CHECK_RESULT;"
+      <> maybe (IPv4.builderUtf8 addr) BB.byteString mhost
+      <> BB.char7 ';'
+      <> BB.byteString name
+      <> BB.char7 ';'
+      <> BB.char7 (case status of {StatusOk -> '0'; StatusWarning -> '1'; StatusCritical -> '2'; StatusUnknown -> '3'})
+      <> BB.char7 ';'
+      <> "Variables:"
+      <> foldMap (encodeVarBind "<br>" r) vars
+      <> (maybe mempty (\x -> "<br>" <> BB.byteString x) (HM.lookup trapName notes))
+      <> BB.char7 '\n'
+    else mempty
   where
   trapName = trapDescription leftovers (fromIntegral code) typ
   (_,_,_,leftovers) = description oid r
+  mhost = M.lookup addr hosts
 
 prettyTrapV2ToBuilder :: Resolver -> Map IPv4 ByteString -> IPv4 -> ObjectIdentifier -> Vector VarBind -> BB.Builder
 prettyTrapV2ToBuilder r reverseDns addr oid vars =
@@ -306,7 +349,13 @@ data Settings = Settings
   , settingsNotes :: !(HashMap ByteString ByteString)
   , settingsNagios :: !Output
   , settingsLogging :: !Output
+  , settingsInterfaces :: !(HashMap ByteString Interfaces)
   }
+
+data Interfaces
+  = All
+  | None
+  | Named !(Vector ByteString)
 
 instance FromJSON Settings where
   parseJSON = AE.withObject "Settings" $ \m -> Settings
@@ -316,6 +365,20 @@ instance FromJSON Settings where
     <*> fmap (HM.fromList . map (bimap TE.encodeUtf8 TE.encodeUtf8) . HM.toList) (m .: "notes")
     <*> m .: "nagios"
     <*> m .: "logging"
+    <*> fmap (HM.fromList . map (bimap TE.encodeUtf8 id) . HM.toList) (m .: "interfaces")
+
+instance FromJSON Interfaces where
+  parseJSON v =
+    AE.withText "Interfaces"
+      (\t -> case t of
+        "all" -> pure All
+        "ALL" -> pure All
+        "none" -> pure None
+        "NONE" -> pure None
+        _ -> pure (Named (V.singleton (TE.encodeUtf8 t)))
+      ) v
+    <|>
+    AE.withArray "Interfaces" (\arr -> Named . (V.map TE.encodeUtf8) <$> mapM AE.parseJSON arr) v
 
 data Output
   = OutputFile String
@@ -412,3 +475,6 @@ uptimeOid = Oid.fromList [1,3,6,1,2,1,1,3,0]
 
 trapOid :: ObjectIdentifier
 trapOid = Oid.fromList [1,3,6,1,6,3,1,1,4,1,0]
+
+ifName :: Primitive.Vector Word
+ifName = Primitive.fromList [1,3,6,1,2,1,31,1,1,1,1]

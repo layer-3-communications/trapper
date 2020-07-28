@@ -98,7 +98,8 @@ runUDPServerForever output nagiosRef (Settings resolver services hosts notes nag
         (bs,sockAddr) <- onException
           (NSB.recvFrom sock 4096)
           (hPutStrLn stderr "Error context: NSB.recvFrom")
-        C.Time nanoseconds <- C.now
+        now@(C.Time nanoseconds) <- C.now
+        let encTime = C.encodeUtf8_YmdHMS C.SubsecondPrecisionAuto C.w3c (C.timeToDatetime now)
         let seconds = div nanoseconds 1000000000
         let addr = sockAddrToIPv4 sockAddr
         case AsnDecoding.ber SnmpDecoding.messageV2 bs of
@@ -106,7 +107,7 @@ runUDPServerForever output nagiosRef (Settings resolver services hosts notes nag
             FL.pushLogStr output (FL.toLogStr (BB.toLazyByteString ("Failed to decode trap from " <> IPv4.builderUtf8 addr <> " with error: " <> fromString err <> "\n")))
           Right (MessageV2 _ (PdusSnmpV2Trap (Pdu _ _ _ bindings))) -> case sanityCheck bindings of
             Just (oid,vars) -> do
-              FL.pushLogStr output (FL.toLogStr (BB.toLazyByteString (prettyTrapV2ToBuilder resolver hosts addr oid vars)))
+              FL.pushLogStr output (FL.toLogStr (BB.toLazyByteString (prettyTrapV2ToBuilder encTime resolver hosts addr oid vars)))
               nagios0 <- readIORef nagiosRef
               let nagiosLine = LB.toStrict (BB.toLazyByteString (trapV2ToBuilder resolver hosts services interfaces notes seconds addr oid vars))
               -- See comment about flushing below.
@@ -124,7 +125,7 @@ runUDPServerForever output nagiosRef (Settings resolver services hosts notes nag
                 )
             Nothing -> FL.pushLogStr output (FL.toLogStr ("Bad trap from " <> IPv4.builderUtf8 addr <> ", varbinds incorrect.\n"))
           Right (MessageV2 _ (PdusSnmpTrap trap)) -> do
-            FL.pushLogStr output (FL.toLogStr (BB.toLazyByteString (prettyTrapToBuilder resolver hosts addr trap)))
+            FL.pushLogStr output (FL.toLogStr (BB.toLazyByteString (prettyTrapToBuilder encTime resolver hosts addr trap)))
             nagios0 <- readIORef nagiosRef
             let nagiosLine = LB.toStrict (BB.toLazyByteString (trapToBuilder resolver hosts services interfaces notes seconds addr trap))
             -- The nagios handle is flushed after every write. We do this because
@@ -264,9 +265,11 @@ trapToBuilder r hosts services interfaces notes seconds addr (TrapPdu oid _ typ 
     <> (maybe mempty (\x -> "<br>" <> BB.byteString x) (HM.lookup trapName notes))
     <> BB.char7 '\n'
 
-prettyTrapV2ToBuilder :: Resolver -> Map IPv4 ByteString -> IPv4 -> ObjectIdentifier -> Vector VarBind -> BB.Builder
-prettyTrapV2ToBuilder r reverseDns addr oid vars =
-     "\nHost Address: "
+prettyTrapV2ToBuilder :: ByteString -> Resolver -> Map IPv4 ByteString -> IPv4 -> ObjectIdentifier -> Vector VarBind -> BB.Builder
+prettyTrapV2ToBuilder encTime r reverseDns addr oid vars =
+     "\nTime: "
+  <> BB.byteString encTime
+  <> "\nHost Address: "
   <> IPv4.builderUtf8 addr
   <> "\nHost: "
   <> maybe (IPv4.builderUtf8 addr) BB.byteString (M.lookup addr reverseDns)
@@ -280,9 +283,11 @@ prettyTrapV2ToBuilder r reverseDns addr oid vars =
   where
   (descr,_,_,_) = description oid r
 
-prettyTrapToBuilder :: Resolver -> Map IPv4 ByteString -> IPv4 -> TrapPdu -> BB.Builder
-prettyTrapToBuilder r reverseDns addr (TrapPdu oid _ typ code _ vars) =
-     "\nHost Address: "
+prettyTrapToBuilder :: ByteString -> Resolver -> Map IPv4 ByteString -> IPv4 -> TrapPdu -> BB.Builder
+prettyTrapToBuilder encTime r reverseDns addr (TrapPdu oid _ typ code _ vars) =
+     "\nTime: "
+  <> BB.byteString encTime
+  <> "\nHost Address: "
   <> IPv4.builderUtf8 addr
   <> "\nHost: "
   <> maybe (IPv4.builderUtf8 addr) BB.byteString (M.lookup addr reverseDns)

@@ -4,6 +4,7 @@
 {-# language DerivingStrategies #-}
 {-# language LambdaCase #-}
 {-# language MagicHash #-}
+{-# language MultiWayIf #-}
 {-# language OverloadedStrings #-}
 {-# language ScopedTypeVariables #-}
 
@@ -157,21 +158,37 @@ sanityCheck v = do
       Just (oid, V.drop 2 v)
     _ -> Nothing
 
-extraInterfaceCheck :: Maybe Interfaces -> ByteString -> Vector VarBind -> Bool
+data InterfaceCheckResult
+  = DefaultAlert
+  | DoNotAlert
+  | SuffixedAlert !ByteString
+
+extraInterfaceCheck :: Maybe Interfaces -> ByteString -> Vector VarBind -> InterfaceCheckResult
 extraInterfaceCheck mreqInterface trapName vars = if trapName == "linkUp" || trapName == "linkDown"
   then case mreqInterface of
     Just reqInterface -> case reqInterface of
-      All -> True
-      None -> False
-      Named intfs -> any (searchForInterface vars) intfs
-    Nothing -> False
-  else True
+      All -> DefaultAlert
+      None -> DoNotAlert
+      Named intfs -> case mapM_ (searchForInterface vars) intfs of
+        Left x -> SuffixedAlert x
+        Right () -> DoNotAlert
+    Nothing -> DoNotAlert
+  else DefaultAlert
 
-searchForInterface :: Vector VarBind -> ByteString -> Bool
+searchForInterface :: Vector VarBind -> ByteString -> Either ByteString ()
 searchForInterface !vars !reqInterface = 
   case V.find (\(VarBind (ObjectIdentifier name@(PM.PrimArray name# )) _) -> Primitive.take 11 (Primitive.Vector 0 (PM.sizeofPrimArray name) (PM.ByteArray name#)) == ifName) vars of
-    Just (VarBind _ (BindingResultValue (ObjectSyntaxSimple (SimpleSyntaxString b)))) -> reqInterface == b
-    _ -> False
+    Just (VarBind _ (BindingResultValue (ObjectSyntaxSimple (SimpleSyntaxString b)))) -> if reqInterface == b
+      then Left ("_" <> cleanInterface reqInterface)
+      else Right ()
+    _ -> Right ()
+
+cleanInterface :: ByteString -> ByteString
+cleanInterface = BC.map $ \c ->
+  if | c >= 'a' && c <= 'z' -> c
+     | c >= 'A' && c <= 'Z' -> c
+     | c == '_' -> c
+     | otherwise -> '_'
 
 -- TODO: Factor out common code.
 trapV2ToBuilder ::
@@ -187,26 +204,29 @@ trapV2ToBuilder ::
   -> BB.Builder
 trapV2ToBuilder r hosts services interfaces notes seconds addr oid vars = case HM.lookup trapName services of
   Nothing -> mempty
-  Just (Service name status) -> if extraInterfaceCheck (flip HM.lookup interfaces =<< mhost) trapName vars
-    then 
-         BB.char7 '['
-      <> BB.int64Dec seconds
-      <> "] PROCESS_SERVICE_CHECK_RESULT;"
-      <> maybe (IPv4.builderUtf8 addr) BB.byteString mhost
-      <> BB.char7 ';'
-      <> BB.byteString name
-      <> BB.char7 ';'
-      <> BB.char7 (case status of {StatusOk -> '0'; StatusWarning -> '1'; StatusCritical -> '2'; StatusUnknown -> '3'})
-      <> BB.char7 ';'
-      <> "Variables:"
-      <> foldMap (encodeVarBind "<br>" r) vars
-      <> (maybe mempty (\x -> "<br>" <> BB.byteString x) (HM.lookup trapName notes))
-      <> BB.char7 '\n'
-    else mempty
+  Just (Service name status) -> case extraInterfaceCheck (flip HM.lookup interfaces =<< mhost) trapName vars of
+    DoNotAlert -> mempty
+    DefaultAlert -> performAlert status name mempty
+    SuffixedAlert suffix -> performAlert status name suffix
   where
   (trapNameBuilder,_,_,_) = description oid r
   trapName = LB.toStrict (BB.toLazyByteString trapNameBuilder)
   mhost = M.lookup addr hosts
+  performAlert status name suffix = 
+       BB.char7 '['
+    <> BB.int64Dec seconds
+    <> "] PROCESS_SERVICE_CHECK_RESULT;"
+    <> maybe (IPv4.builderUtf8 addr) BB.byteString mhost
+    <> BB.char7 ';'
+    <> BB.byteString name
+    <> BB.byteString suffix
+    <> BB.char7 ';'
+    <> BB.char7 (case status of {StatusOk -> '0'; StatusWarning -> '1'; StatusCritical -> '2'; StatusUnknown -> '3'})
+    <> BB.char7 ';'
+    <> "Variables:"
+    <> foldMap (encodeVarBind "<br>" r) vars
+    <> (maybe mempty (\x -> "<br>" <> BB.byteString x) (HM.lookup trapName notes))
+    <> BB.char7 '\n'
 
 trapToBuilder ::
      Resolver
@@ -220,26 +240,29 @@ trapToBuilder ::
   -> BB.Builder
 trapToBuilder r hosts services interfaces notes seconds addr (TrapPdu oid _ typ code _ vars) = case HM.lookup trapName services of
   Nothing -> mempty
-  Just (Service name status) -> if extraInterfaceCheck (flip HM.lookup interfaces =<< mhost) trapName (V.fromList vars)
-    then
-         BB.char7 '['
-      <> BB.int64Dec seconds
-      <> "] PROCESS_SERVICE_CHECK_RESULT;"
-      <> maybe (IPv4.builderUtf8 addr) BB.byteString mhost
-      <> BB.char7 ';'
-      <> BB.byteString name
-      <> BB.char7 ';'
-      <> BB.char7 (case status of {StatusOk -> '0'; StatusWarning -> '1'; StatusCritical -> '2'; StatusUnknown -> '3'})
-      <> BB.char7 ';'
-      <> "Variables:"
-      <> foldMap (encodeVarBind "<br>" r) vars
-      <> (maybe mempty (\x -> "<br>" <> BB.byteString x) (HM.lookup trapName notes))
-      <> BB.char7 '\n'
-    else mempty
+  Just (Service name status) -> case extraInterfaceCheck (flip HM.lookup interfaces =<< mhost) trapName (V.fromList vars) of
+    DoNotAlert -> mempty
+    DefaultAlert -> performAlert status name mempty
+    SuffixedAlert suffix -> performAlert status name suffix
   where
   trapName = trapDescription leftovers (fromIntegral code) typ
   (_,_,_,leftovers) = description oid r
   mhost = M.lookup addr hosts
+  performAlert status name suffix = 
+       BB.char7 '['
+    <> BB.int64Dec seconds
+    <> "] PROCESS_SERVICE_CHECK_RESULT;"
+    <> maybe (IPv4.builderUtf8 addr) BB.byteString mhost
+    <> BB.char7 ';'
+    <> BB.byteString name
+    <> BB.byteString suffix
+    <> BB.char7 ';'
+    <> BB.char7 (case status of {StatusOk -> '0'; StatusWarning -> '1'; StatusCritical -> '2'; StatusUnknown -> '3'})
+    <> BB.char7 ';'
+    <> "Variables:"
+    <> foldMap (encodeVarBind "<br>" r) vars
+    <> (maybe mempty (\x -> "<br>" <> BB.byteString x) (HM.lookup trapName notes))
+    <> BB.char7 '\n'
 
 prettyTrapV2ToBuilder :: Resolver -> Map IPv4 ByteString -> IPv4 -> ObjectIdentifier -> Vector VarBind -> BB.Builder
 prettyTrapV2ToBuilder r reverseDns addr oid vars =

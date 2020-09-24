@@ -31,6 +31,7 @@ import Net.Types (IPv4(..))
 import Snmp.Types (BindingResult(..),VarBind(..))
 import Snmp.Types (MessageV2(..),Pdus(..),TrapPdu(..),Pdu(..),ObjectSyntax(..))
 import Snmp.Types (SimpleSyntax(..),ApplicationSyntax(..),GenericTrap(..))
+import System.Directory (doesFileExist)
 import System.IO (Handle,IOMode(WriteMode),openFile,stderr,stdout,hPutStrLn)
 import System.Log.FastLogger (LoggerSet)
 
@@ -68,7 +69,7 @@ main = do
             OutputStdout -> pure (output,stdout)
             OutputStderr -> pure (output,stderr)
             OutputFile path -> do
-              nagios <- openFile path WriteMode
+              nagios <- openPreexistingOutputFile path
               pure (output,nagios)
       )
       (\(output,_) -> FL.rmLoggerSet output)
@@ -76,6 +77,12 @@ main = do
         nagiosRef <- newIORef nagios
         runUDPServerForever output nagiosRef s
       )
+
+-- The file must already exist. We will not create it.
+openPreexistingOutputFile :: String -> IO Handle
+openPreexistingOutputFile path = doesFileExist path >>= \case
+  True -> openFile path WriteMode
+  False -> fail $ "file did not exist: " ++ path
 
 outputToLoggerSet :: Output -> IO LoggerSet
 outputToLoggerSet = \case
@@ -119,7 +126,7 @@ runUDPServerForever output nagiosRef (Settings resolver services hosts notes nag
                     OutputStdout -> fail "Not attempting to reopen stdout. Dieing."
                     OutputStderr -> fail "Not attempting to reopen stderr. Dieing."
                     OutputFile path -> do
-                      nagios1 <- openFile path WriteMode
+                      nagios1 <- openPreexistingOutputFile path
                       B.hPut nagios1 nagiosLine
                       writeIORef nagiosRef nagios1
                 )
@@ -140,7 +147,7 @@ runUDPServerForever output nagiosRef (Settings resolver services hosts notes nag
                   OutputStdout -> fail "Not attempting to reopen stdout. Dieing."
                   OutputStderr -> fail "Not attempting to reopen stderr. Dieing."
                   OutputFile path -> do
-                    nagios1 <- openFile path WriteMode
+                    nagios1 <- openPreexistingOutputFile path
                     B.hPut nagios1 nagiosLine
                     writeIORef nagiosRef nagios1
               )

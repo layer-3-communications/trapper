@@ -195,6 +195,7 @@ cleanInterface :: ByteString -> ByteString
 cleanInterface = BC.map $ \c ->
   if | c >= 'a' && c <= 'z' -> c
      | c >= 'A' && c <= 'Z' -> c
+     | c >= '0' && c <= '9' -> c
      | c == '_' -> c
      | otherwise -> '_'
 
